@@ -31,6 +31,14 @@ The RabbitMQ queues are durable quorum queues:
 
 The inbound consumer records stable update IDs in PostgreSQL and locks the affected task while applying an update. Duplicate IDs do nothing. Updates that would regress a terminal task are recorded and ignored. Database errors are retried with a delay; malformed and otherwise unprocessable messages are dead-lettered rather than stopping the consumer.
 
+## Phase 2 data model and transaction boundaries
+
+The ORM defines `tenants`, `tasks`, `outbox_events`, and `processed_updates`; production schema changes are applied with Alembic (`alembic upgrade head`), not `Base.metadata.create_all()`. Tenant slug format and nonblank names are checked both at request validation and by PostgreSQL constraints. Slug uniqueness is a database unique constraint independent of tenant status. Timestamps are timezone-aware UTC in storage and serialize as ISO 8601 with millisecond precision and a trailing `Z`.
+
+The domain transition tables are centralized in `app/domain.py`. Tasks may transition only `accepted -> in_progress -> done|failed`; terminal states have no outgoing transitions. Tenant transitions follow the assignment state machine.
+
+`SessionLocal` is the configured SQLAlchemy session factory; `transaction_scope()` commits when its block succeeds and rolls back if an exception escapes. Operations that need application-specific handling use an explicit `session.begin()` transaction. Creating a tenant, its deploy task, and its outbox row is one atomic database transaction. PATCH/DELETE state/version changes, the corresponding task, and its outbox row are likewise atomic. Applying a worker update, recording its idempotency key, changing the task, and applying a terminal tenant mutation share one transaction. The outbox publisher’s broker publish and later `published_at` update cannot be one distributed transaction; duplicate delivery is possible and is handled through idempotency.
+
 ## Requirements and implementation choices
 
 **Assignment requirements implemented:** tenant/task state machines; unique tenant slugs including destroyed tenants; optimistic version checks; tenant CRUD and read-only task routes; structured errors; PostgreSQL persistence; post-commit task publishing; idempotent/order-tolerant progress processing; configurable worker simulation; and local setup, tests, and quality checks.

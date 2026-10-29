@@ -1,5 +1,12 @@
 from typing import Literal
 
+TENANT_SLUG_REGEX = r"^[a-z][-a-z0-9]{1,26}[a-z0-9]$"
+TENANT_STATUSES = frozenset(
+    {"provisioning", "active", "updating", "destroying", "destroyed", "failed"}
+)
+TASK_STATUSES = frozenset({"accepted", "in_progress", "done", "failed"})
+TASK_TYPES = frozenset({"deploy", "update", "destroy"})
+
 TaskStatus = Literal["accepted", "in_progress", "done", "failed"]
 
 TENANT_TRANSITIONS: dict[str, set[str]] = {
@@ -12,7 +19,7 @@ TENANT_TRANSITIONS: dict[str, set[str]] = {
 }
 
 TASK_TRANSITIONS: dict[str, set[str]] = {
-    "accepted": {"in_progress", "done", "failed"},
+    "accepted": {"in_progress"},
     "in_progress": {"done", "failed"},
     "done": set(),
     "failed": set(),

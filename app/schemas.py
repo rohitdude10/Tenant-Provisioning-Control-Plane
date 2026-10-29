@@ -13,8 +13,9 @@ from pydantic import (
 )
 
 from app.core.time import format_timestamp
+from app.domain import TENANT_SLUG_REGEX
 
-SLUG_PATTERN = re.compile(r"^[a-z][-a-z0-9]{1,26}[a-z0-9]$")
+SLUG_PATTERN = re.compile(TENANT_SLUG_REGEX)
 
 
 class TenantCreate(BaseModel):

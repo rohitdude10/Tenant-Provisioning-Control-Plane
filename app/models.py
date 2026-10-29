@@ -17,6 +17,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.time import utc_now
 from app.db import Base
+from app.domain import TASK_STATUSES, TASK_TYPES, TENANT_SLUG_REGEX, TENANT_STATUSES
 
 
 class Tenant(Base):
@@ -26,7 +27,15 @@ class Tenant(Base):
         CheckConstraint("length(name) > 0", name="ck_tenants_name_nonempty"),
         CheckConstraint("version >= 1", name="ck_tenants_version_positive"),
         CheckConstraint(
-            "status IN ('provisioning', 'active', 'updating', 'destroying', 'destroyed', 'failed')",
+            "length(btrim(name)) > 0",
+            name="ck_tenants_name_not_blank",
+        ),
+        CheckConstraint(
+            f"slug ~ '{TENANT_SLUG_REGEX}'",
+            name="ck_tenants_slug_format",
+        ),
+        CheckConstraint(
+            "status IN (" + ", ".join(f"'{status}'" for status in sorted(TENANT_STATUSES)) + ")",
             name="ck_tenants_status",
         ),
     )
@@ -48,9 +57,12 @@ class Tenant(Base):
 class Task(Base):
     __tablename__ = "tasks"
     __table_args__ = (
-        CheckConstraint("type IN ('deploy', 'update', 'destroy')", name="ck_tasks_type"),
         CheckConstraint(
-            "status IN ('accepted', 'in_progress', 'done', 'failed')",
+            "type IN (" + ", ".join(f"'{task_type}'" for task_type in sorted(TASK_TYPES)) + ")",
+            name="ck_tasks_type",
+        ),
+        CheckConstraint(
+            "status IN (" + ", ".join(f"'{status}'" for status in sorted(TASK_STATUSES)) + ")",
             name="ck_tasks_status",
         ),
         Index("ix_tasks_tenant_created", "tenant_id", "created_at"),
@@ -91,6 +103,7 @@ class OutboxEvent(Base):
 
 class ProcessedUpdate(Base):
     __tablename__ = "processed_updates"
+    __table_args__ = (Index("ix_processed_updates_task", "task_id"),)
 
     update_id: Mapped[str] = mapped_column(String(200), primary_key=True)
     task_id: Mapped[UUID] = mapped_column(

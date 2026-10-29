@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 import pytest
 
@@ -19,10 +20,14 @@ if TEST_RABBITMQ_URL:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def create_integration_schema():
+def migrate_integration_database():
     if TEST_DATABASE_URL:
-        from app import models  # noqa: F401
-        from app.db import Base, engine
+        from alembic.config import Config
 
-        Base.metadata.create_all(engine)
+        from alembic import command
+
+        project_root = Path(__file__).resolve().parents[1]
+        config = Config(str(project_root / "alembic.ini"))
+        config.set_main_option("script_location", str(project_root / "alembic"))
+        command.upgrade(config, "head")
     yield

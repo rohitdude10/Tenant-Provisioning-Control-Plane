@@ -36,3 +36,10 @@ def test_timestamp_serialization_has_utc_milliseconds_and_z_suffix():
     assert format_timestamp(datetime(2025, 1, 2, 3, 4, 5, 123456, tzinfo=UTC)) == (
         "2025-01-02T03:04:05.123Z"
     )
+
+
+def test_timestamp_serialization_rejects_naive_values():
+    from datetime import datetime
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        format_timestamp(datetime(2025, 1, 2, 3, 4, 5))
