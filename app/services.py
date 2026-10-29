@@ -110,7 +110,12 @@ def update_tenant(session: Session, tenant_id: UUID, request: TenantPatch) -> tu
                 Tenant.version == request.version,
                 Tenant.status == "active",
             )
-            .values(status="updating", version=Tenant.version + 1, updated_at=now)
+            .values(
+                status="updating",
+                name=request.name,
+                version=Tenant.version + 1,
+                updated_at=now,
+            )
         )
         if result.rowcount != 1:
             raise DomainError(
@@ -210,8 +215,6 @@ def apply_worker_update(session: Session, update_message: WorkerUpdate) -> bool:
                     f"Cannot move tenant {tenant.id} from {tenant.status} to {target_status}"
                 )
             tenant.status = target_status
-            if task.type == "update" and update_message.status == "done":
-                tenant.name = task.payload["name"]
             tenant.version += 1
             tenant.updated_at = now
     return True

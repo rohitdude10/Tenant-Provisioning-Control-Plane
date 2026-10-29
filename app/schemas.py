@@ -22,6 +22,8 @@ class TenantCreate(BaseModel):
     slug: str = Field(min_length=3, max_length=28)
     name: str = Field(min_length=1, max_length=255)
 
+    model_config = ConfigDict(extra="forbid")
+
     @field_validator("slug")
     @classmethod
     def validate_slug(cls, value: str) -> str:

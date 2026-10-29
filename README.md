@@ -160,9 +160,11 @@ Invoke-RestMethod -Method Patch `
   -Body '{"version":2,"name":"Acme Updated"}'
 ```
 
-The deploy completion increments version from 1 to 2; accepting the update increments it again. The new name is applied only when its update task succeeds.
+The deploy completion increments version from 1 to 2. PATCH requires that current version in its JSON body; accepting the update atomically changes the name, moves the tenant to `updating`, increments its version, and creates the update task and outbox row in the same PostgreSQL transaction. A later successful worker update moves the tenant back to `active`; failure moves it to `failed`.
 
-Errors use a stable structured response, for example:
+The expected version format is a required JSON integer field named `version` in the PATCH body (for example `{"version":2,"name":"Acme Updated"}`). Missing, null, non-integer, or less-than-one versions return the structured `validation_error` response with HTTP 422. Stale versions return `tenant_version_conflict` with HTTP 409. This choice keeps the optimistic-lock precondition explicit in the request body rather than introducing an ETag/`If-Match` header.
+
+The API persists the corresponding outbox record in the same database transaction; the tenant API handler does not publish to RabbitMQ. Errors use a stable structured response, for example:
 
 ```json
 {
