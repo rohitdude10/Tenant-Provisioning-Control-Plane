@@ -1,6 +1,6 @@
 import logging
 import math
-import time
+import threading
 from datetime import timedelta
 from typing import Any
 
@@ -19,6 +19,7 @@ from app.messaging.rabbit import (
     retry_connection,
 )
 from app.models import OutboxEvent
+from app.processes.shutdown import shutdown_event
 
 logger = logging.getLogger(__name__)
 TRANSIENT_BROKER_ERRORS = (pika.exceptions.AMQPError, OSError, TimeoutError)
@@ -110,8 +111,10 @@ def publish_once() -> bool:
     return True
 
 
-def run() -> None:
+def run(stop_event: threading.Event | None = None) -> None:
     settings = get_settings()
+    if stop_event is None:
+        stop_event = shutdown_event()
     logger.info(
         "Outbox publisher started; poll interval %.2fs; retry backoff %.2f..%.2fs",
         settings.outbox_poll_seconds,
@@ -119,11 +122,11 @@ def run() -> None:
         settings.outbox_retry_max_seconds,
     )
     retry_delay = 1.0
-    while True:
+    while not stop_event.is_set():
         try:
             check_database()
             if not publish_once():
-                time.sleep(settings.outbox_poll_seconds)
+                stop_event.wait(settings.outbox_poll_seconds)
             else:
                 retry_delay = 1.0
         except KeyboardInterrupt:
@@ -132,13 +135,14 @@ def run() -> None:
             logger.exception(
                 "Outbox publisher infrastructure failure; retrying in %.1f seconds", retry_delay
             )
-            time.sleep(retry_delay)
+            stop_event.wait(retry_delay)
             retry_delay = min(retry_delay * 2, 30.0)
 
 
 def main() -> None:
     logging.basicConfig(level=get_settings().log_level.upper())
-    retry_connection(run, "outbox publisher")
+    stop_event = shutdown_event()
+    retry_connection(lambda: run(stop_event), "outbox publisher", stop_event)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 .venv/
 __pycache__/
 *.py[cod]
@@ -11,3 +13,8 @@ logs/
 *.egg-info/
 build/
 dist/
+*.sqlite
+*.sqlite3
+*.db
+*.pem
+*.key

@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 import time
 from collections.abc import Callable
 from typing import Any
@@ -127,9 +128,13 @@ def decode_message(body: bytes, parser: Callable[[dict[str, Any]], Any]) -> Any:
         raise ValueError(f"invalid JSON message: {exc}") from exc
 
 
-def retry_connection(run: Callable[[], None], process_name: str) -> None:
+def retry_connection(
+    run: Callable[[], None],
+    process_name: str,
+    stop_event: threading.Event | None = None,
+) -> None:
     delay = 1.0
-    while True:
+    while stop_event is None or not stop_event.is_set():
         try:
             run()
             delay = 1.0
@@ -140,5 +145,9 @@ def retry_connection(run: Callable[[], None], process_name: str) -> None:
             logger.error(
                 "%s connection failed: %s; retrying in %.1f seconds", process_name, exc, delay
             )
-            time.sleep(delay)
+            if stop_event is not None:
+                stop_event.wait(delay)
+            else:
+                time.sleep(delay)
             delay = min(delay * 2, 30.0)
+    logger.info("%s stopped", process_name)

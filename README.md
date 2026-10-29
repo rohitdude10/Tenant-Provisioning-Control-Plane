@@ -1,61 +1,92 @@
 # Tenant Provisioning Control Plane
 
-A Python/FastAPI control plane that persists tenant and task state in PostgreSQL and exchanges durable task/progress messages with RabbitMQ. **Phases 1–5 run directly on Windows; no Docker or Compose is used or required.** PostgreSQL and RabbitMQ are explicit local prerequisites.
+A local-first Python service that provisions tenants asynchronously. FastAPI accepts tenant operations, PostgreSQL stores tenant/task state and an atomic transactional outbox, and RabbitMQ carries task and progress messages. The API, outbox publisher, inbound consumer, and worker simulator run as separate local Python processes.
+
+**Windows is the supported development platform. Docker, Docker Compose, containers, SQLite, and in-memory broker substitutes are not used.** The assignment source in this workspace is `Control_Plane_CANDIDATE_BRIEF (1).md`; there is no separate `ASSIGNMENT.md` file.
 
 ## Architecture
 
 ```text
-                         PostgreSQL
-                   tenants / tasks / outbox
-                    ^                  |
-                    |                  | committed outbox rows
-           inbound consumer            v
-                    |            outbox publisher
-                    |                  |
-                    +------ RabbitMQ --+
-                           ^       |
-                    progress       | accepted tasks
-                           |       v
-                    worker simulator
-
-             FastAPI API <----> PostgreSQL
+ Clients
+    |
+    v
+ FastAPI API --------------------> PostgreSQL
+    |                              tenants / tasks
+    |                              outbox_events
+    |                              processed_updates
+    |                                   ^
+    |                                   | atomic task, tenant,
+    |                                   | idempotency transaction
+    v                                   |
+ Outbox publisher --> RabbitMQ --> Worker simulator
+                         ^               |
+                         |               | confirmed progress updates
+                         +---------------+
+                      inbound consumer
 ```
 
-The API, outbox publisher, inbound consumer, and worker simulator are separate Python processes. PostgreSQL is the source of truth. API mutations update the tenant and create its task and outbox row within one transaction. The publisher claims pending rows with PostgreSQL `FOR UPDATE SKIP LOCKED`, keeps the claim locked through RabbitMQ publisher confirmation, and marks a row published only after confirmation. Transient broker failures persist an exponentially increasing retry time in PostgreSQL, capped by `OUTBOX_RETRY_MAX_SECONDS`; a publisher restart therefore preserves pending work and its retry schedule. If it crashes after broker confirmation but before the published marker commits, the event can be delivered again; the task UUID is used as both the event ID and RabbitMQ message ID, and consumers must be idempotent. This is at-least-once delivery, not exactly-once delivery.
+### Component responsibilities
 
-The RabbitMQ work and update queues are durable quorum queues:
+- **API**: tenant CRUD and read-only task routes. Each accepted create/update/delete transaction writes the tenant mutation, task, and outbox row together. The HTTP handler does not publish to RabbitMQ.
+- **PostgreSQL**: durable source of truth, optimistic tenant versions, state constraints, unique slugs, task records, durable publisher retry schedule, and idempotency keys.
+- **Transactional outbox publisher**: claims eligible rows using PostgreSQL `FOR UPDATE SKIP LOCKED`, publishes persistent task events with RabbitMQ publisher confirms, and marks them published only after confirmation. Multiple instances do not concurrently claim a row.
+- **RabbitMQ**: durable quorum task/update queues and dead-letter queues. Durable TTL retry queues hold delayed inbound retries.
+- **Worker simulator**: independently consumes and validates accepted task events, publishes `in_progress` and then `done` or `failed`, and acknowledges the task only once both progress publications are confirmed.
+- **Inbound consumer**: validates updates, applies task/tenant changes and the processed-update record in one database transaction, and acknowledges only after that transaction succeeds.
 
-- `tenant.provisioning.tasks` — accepted task events sent to the worker.
-- `tenant.provisioning.updates` — worker progress updates sent to the control plane.
-- `tenant.provisioning.tasks.dead` and `tenant.provisioning.updates.dead` — rejected poison messages.
+## State and delivery guarantees
 
-The worker validates each task event, publishes `in_progress` followed by `done` or `failed`, and waits for RabbitMQ publisher confirms for both updates before acknowledging the task. If publishing fails, it requeues the task; its deterministic `task-id:status` update IDs make republished progress idempotent. Malformed task events are rejected to the task dead-letter queue, and already-progressed task events are acknowledged without repeating work.
+Task transitions are strictly `accepted -> in_progress -> done|failed`. `done` and `failed` are terminal. Tenant transitions are:
 
-The inbound consumer commits the task mutation, tenant mutation, and unique `processed_updates` record in one PostgreSQL transaction, then acknowledges the RabbitMQ update. Duplicate update IDs are acknowledged without changing state. Stale updates after a terminal task are recorded and ignored. A terminal result received while its task is still `accepted` is invalid: it is not recorded or applied and is dead-lettered immediately; it must not skip the required `accepted -> in_progress -> terminal` progression. Operators can correct the ordering and replay that update, retaining its original update ID. This is a permanent rejection rather than an automatic requeue, so it cannot loop forever.
+```text
+provisioning -> active       (deploy done)
+provisioning -> failed       (deploy failed)
+active       -> updating     (PATCH accepted)
+updating     -> active       (update done)
+updating     -> failed       (update failed)
+active       -> destroying   (DELETE accepted)
+failed       -> destroying   (DELETE accepted)
+destroying   -> destroyed    (destroy done)
+destroying   -> failed       (destroy failed)
+```
 
-Transient database errors are republished with publisher confirms to durable TTL retry queues, then acknowledged from the original queue. Backoff doubles from `INBOUND_RETRY_SECONDS` up to `INBOUND_RETRY_MAX_SECONDS`; after `INBOUND_RETRY_MAX_ATTEMPTS` scheduled retries, a further database failure is dead-lettered. Malformed updates, unknown task IDs, invalid retry headers, and database constraint violations go directly to the dead-letter queue. If RabbitMQ is unavailable while a retry is being scheduled, the original message remains unacknowledged/requeued; the process-level broker reconnect loop backs off while preserving delivery.
+Important invariants and trade-offs:
 
-## Phase 2 data model and transaction boundaries
+- A tenant slug is unique in PostgreSQL even after its tenant reaches `destroyed`. PATCH uses a conditional update on both the expected version and active status, so simultaneous requests with one version cannot both succeed.
+- API task/outbox creation and inbound task/tenant/idempotency updates are atomic database transactions. A rollback leaves none of the coupled changes committed.
+- Outbound broker publication and the `published_at` database update cannot share a distributed transaction. A crash after RabbitMQ confirmation but before the marker commits can publish the same event again. The task UUID is the event ID and broker message ID; consumers must be idempotent.
+- Worker progress IDs are stable and deterministic (`<task-uuid>:in_progress`, followed by `<task-uuid>:done` or `<task-uuid>:failed`). A redelivered task reuses those IDs. Updates with an already-processed ID do not mutate state a second time.
+- A terminal update received while the task is still `accepted` is invalid: it is not saved and is dead-lettered immediately. It cannot bypass the required `in_progress` state or enter an infinite retry loop. Correct the ordering and replay it with the same ID. Stale updates after a terminal task are recorded as handled no-ops; terminal state never regresses.
+- Malformed payloads, unknown task IDs, and permanent database constraint errors are dead-lettered without stopping a consumer. Transient database failures use confirmed republishing to durable TTL queues with exponential delay: `INBOUND_RETRY_SECONDS` doubles to `INBOUND_RETRY_MAX_SECONDS`, up to `INBOUND_RETRY_MAX_ATTEMPTS`; another failure is dead-lettered. If RabbitMQ is unavailable while scheduling a retry, the original message is requeued. The outbox uses a persisted, bounded exponential retry schedule and keeps unpublished rows after restarts.
+- There is no authentication/authorization layer, and the simulator models work rather than calling a real provisioning backend. Configure the local service and bind/API access accordingly. Windows service installation and database/broker account setup remain machine-specific one-time tasks.
 
-The ORM defines `tenants`, `tasks`, `outbox_events`, and `processed_updates`; production schema changes are applied with Alembic (`alembic upgrade head`), not `Base.metadata.create_all()`. Tenant slug format and nonblank names are checked both at request validation and by PostgreSQL constraints. Slug uniqueness is a database unique constraint independent of tenant status. Timestamps are timezone-aware UTC in storage and serialize as ISO 8601 with millisecond precision and a trailing `Z`.
+## Windows prerequisites (one-time machine setup)
 
-The domain transition tables are centralized in `app/domain.py`. Tasks may transition only `accepted -> in_progress -> done|failed`; terminal states have no outgoing transitions. Tenant transitions follow the assignment state machine.
+Use 64-bit Windows and **Python 3.11** (the project and full suite were verified with Python 3.11.7). PostgreSQL **14 or newer** is the supported local database target; this workspace's installed service is PostgreSQL 18. RabbitMQ must support durable quorum queues; this workspace's installed broker is RabbitMQ 4.4.0. Use a 64-bit Erlang/OTP version supported by the exact RabbitMQ release. RabbitMQ 4.4.0 supports Erlang/OTP 27.x–29.x according to the [official compatibility matrix](https://www.rabbitmq.com/docs/which-erlang). Do not mix arbitrary Erlang and RabbitMQ versions.
 
-`SessionLocal` is the configured SQLAlchemy session factory; `transaction_scope()` commits when its block succeeds and rolls back if an exception escapes. Operations that need application-specific handling use an explicit `session.begin()` transaction. Creating a tenant, its deploy task, and its outbox row is one atomic database transaction. PATCH/DELETE state/version changes, the corresponding task, and its outbox row are likewise atomic. Applying a worker update, recording its idempotency key, changing the task, and applying a terminal tenant mutation share one transaction. The outbox publisher’s broker publish and later `published_at` update cannot be one distributed transaction; duplicate delivery is possible and is handled through idempotency. Concurrent publisher instances use `FOR UPDATE SKIP LOCKED` so only one holds and publishes a given pending row at a time. Broker retry starts at `OUTBOX_RETRY_BASE_SECONDS` and doubles up to `OUTBOX_RETRY_MAX_SECONDS`; the attempt count and next attempt time are stored with the outbox row.
+1. **Python**: install Python 3.11 for Windows from [python.org](https://www.python.org/downloads/windows/) and enable the Python Launcher. Verify in PowerShell:
 
-## Requirements and implementation choices
+   ```powershell
+   py -3.11 --version
+   ```
 
-**Assignment requirements implemented:** tenant/task state machines; unique tenant slugs including destroyed tenants; optimistic version checks; tenant CRUD and read-only task routes; structured errors; PostgreSQL persistence; post-commit task publishing; idempotent/order-tolerant progress processing; configurable worker simulation; and local setup, tests, and quality checks.
+2. **PostgreSQL**: install a supported PostgreSQL Windows release and command-line tools using the [official Windows download page](https://www.postgresql.org/download/windows/). Keep its Windows service enabled/running. Verify:
 
-**Implementation choices:** Python 3.11+, FastAPI, SQLAlchemy 2, Alembic, PostgreSQL, RabbitMQ via Pika; JSON error envelope; `POST/PATCH/DELETE` return `202 Accepted`; list endpoints use `limit`/`offset`; PostgreSQL outbox; RabbitMQ quorum queues and dead-letter queues; and PowerShell scripts for Windows setup and process management.
+   ```powershell
+   psql --version
+   pg_isready -h localhost -p 5432
+   ```
 
-## Windows prerequisites (manual, once per machine)
+3. **RabbitMQ and Erlang/OTP**: follow the [official RabbitMQ Windows installation guide](https://www.rabbitmq.com/docs/install-windows) and its [Erlang compatibility matrix](https://www.rabbitmq.com/docs/which-erlang). Install Erlang as an administrator as the RabbitMQ Windows service requires, then install/start RabbitMQ. Verify from a terminal where RabbitMQ's `sbin` directory is on `PATH`:
 
-### PostgreSQL
+   ```powershell
+   rabbitmq-diagnostics.bat -q ping
+   rabbitmqctl.bat status
+   ```
 
-1. Install PostgreSQL for Windows from [the official PostgreSQL Windows download page](https://www.postgresql.org/download/windows/). Install the server and command-line tools. pgAdmin is optional.
-2. Set a local administrator password during installation. Leave the PostgreSQL Windows service enabled and start it from **Services** or the PostgreSQL installer’s service controls.
-3. Create an application user and two databases (the second is disposable and used only by tests). In `psql` as a PostgreSQL administrator:
+   If the commands are not on `PATH`, run the `.bat` files under the installed RabbitMQ `sbin` directory. The RabbitMQ Windows guide documents Erlang service discovery, CLI authentication, and the Erlang cookie.
+
+4. **Create application identities and resources**. In `psql` as a PostgreSQL administrator, choose a strong local password and create separate development and disposable test databases:
 
    ```sql
    CREATE USER tenant_app WITH PASSWORD '<choose-a-local-password>';
@@ -63,159 +94,329 @@ The domain transition tables are centralized in `app/domain.py`. Tasks may trans
    CREATE DATABASE tenant_control_plane_test OWNER tenant_app;
    ```
 
-### RabbitMQ
-
-1. Install a RabbitMQ-supported Erlang/OTP version, then install RabbitMQ for Windows using [the official Windows installation guide](https://www.rabbitmq.com/docs/install-windows).
-2. Start the RabbitMQ Windows service. Service names and installation locations depend on the installed versions.
-3. Create an application user and two virtual hosts, then grant permissions. From an elevated PowerShell or Command Prompt with `rabbitmqctl` available (replace the password):
+   In an elevated PowerShell or Command Prompt with `rabbitmqctl.bat` available, create matching development/test virtual hosts and a dedicated user:
 
    ```powershell
-   rabbitmqctl add_user tenant_app "<choose-a-local-password>"
-   rabbitmqctl add_vhost tenant_control_plane
-   rabbitmqctl add_vhost tenant_control_plane_test
-   rabbitmqctl set_permissions -p tenant_control_plane tenant_app ".*" ".*" ".*"
-   rabbitmqctl set_permissions -p tenant_control_plane_test tenant_app ".*" ".*" ".*"
+   rabbitmqctl.bat add_user tenant_app "<choose-a-local-password>"
+   rabbitmqctl.bat add_vhost tenant_control_plane
+   rabbitmqctl.bat add_vhost tenant_control_plane_test
+   rabbitmqctl.bat set_permissions -p tenant_control_plane tenant_app ".*" ".*" ".*"
+   rabbitmqctl.bat set_permissions -p tenant_control_plane_test tenant_app ".*" ".*" ".*"
    ```
 
-   The test virtual host keeps test queues separate from development queues. The built-in `guest` account is restricted to localhost; this application uses a dedicated account instead.
+   PostgreSQL is expected on `localhost:5432` and RabbitMQ AMQP on `localhost:5672` by default. Change the `.env` URLs if your host, port, user, password, database, or vhost differs. URL-encode reserved characters in credentials. The test resources must remain separate from development resources.
 
-These installers, service permissions, database creation, RabbitMQ users/virtual hosts, and firewall/security decisions require machine-specific setup and may need an administrator. The application scripts deliberately do not attempt to install packages, create users, change Windows services, or bypass those permissions. They check connectivity and report actionable failures.
+Service installation, account/password choice, permissions, service startup, Erlang cookie setup, firewall decisions, and any administrator approval are intentionally not automated. The application scripts never install or reconfigure system services.
 
-## Python environment and configuration
+## Configuration and local startup
 
-From the repository root, in PowerShell:
-
-```powershell
-.\scripts\setup-local.ps1
-```
-
-The script requires Python 3.11 and creates `.venv`, installs the project and development dependencies, and copies `.env.example` to `.env` if needed. Edit `.env` with the local credentials you configured. Keep `.env` private; it is ignored by Git. `.env.example` contains placeholders only.
-
-Example local URLs:
-
-```dotenv
-DATABASE_URL=postgresql+psycopg://tenant_app:your-password@localhost:5432/tenant_control_plane
-RABBITMQ_URL=amqp://tenant_app:your-password@localhost:5672/tenant_control_plane
-TEST_DATABASE_URL=postgresql+psycopg://tenant_app:your-password@localhost:5432/tenant_control_plane_test
-TEST_RABBITMQ_URL=amqp://tenant_app:your-password@localhost:5672/tenant_control_plane_test
-```
-
-URL-encode any reserved characters in passwords. The application rejects non-PostgreSQL database URLs and does not provide SQLite or in-memory broker fallbacks.
-
-## Start and stop all local processes
-
-After the one-time Windows service and `.env` setup:
+From the repository root in PowerShell, one command bootstraps the Python environment if necessary, preserves an existing `.env`, checks PostgreSQL/RabbitMQ, applies Alembic migrations, starts the four application processes, and waits for API readiness:
 
 ```powershell
 .\scripts\start-local.ps1
 ```
 
-This single application boot command verifies PostgreSQL and RabbitMQ connectivity, creates durable RabbitMQ queues, applies Alembic migrations, then starts the API, publisher, inbound consumer, and worker simulator as separate background Python processes. Logs are written to `logs\`; process IDs are tracked in `.run\`. To stop only the processes started by the script:
+On a first clone, the script creates `.venv` and copies `.env.example` to `.env` if missing. It never overwrites `.env`. Configure the local credentials in `.env` (or supply the corresponding environment variables) and run the same startup command again. Python package installation is performed in the project virtual environment; the script does not install PostgreSQL, RabbitMQ, Erlang, or Windows services.
+
+Relevant `.env` entries (the checked-in example contains placeholders only):
+
+```dotenv
+DATABASE_URL=postgresql+psycopg://tenant_app:REPLACE_WITH_LOCAL_PASSWORD@localhost:5432/tenant_control_plane
+RABBITMQ_URL=amqp://tenant_app:REPLACE_WITH_LOCAL_PASSWORD@localhost:5672/tenant_control_plane
+API_HOST=127.0.0.1
+API_PORT=8000
+LOG_LEVEL=INFO
+OUTBOX_POLL_SECONDS=1.0
+OUTBOX_RETRY_BASE_SECONDS=1.0
+OUTBOX_RETRY_MAX_SECONDS=30.0
+INBOUND_RETRY_SECONDS=2.0
+INBOUND_RETRY_MAX_SECONDS=30.0
+INBOUND_RETRY_MAX_ATTEMPTS=5
+WORKER_FAIL_RATE=0.0
+WORKER_MIN_DELAY_MS=250
+WORKER_MAX_DELAY_MS=1000
+TEST_DATABASE_URL=postgresql+psycopg://tenant_app:REPLACE_WITH_LOCAL_PASSWORD@localhost:5432/tenant_control_plane_test
+TEST_RABBITMQ_URL=amqp://tenant_app:REPLACE_WITH_LOCAL_PASSWORD@localhost:5672/tenant_control_plane_test
+```
+
+`.env` is ignored by Git. Never commit it, real credentials, or credential-bearing URLs. The startup script records per-process PIDs in `.run\` and logs stdout/stderr under `logs\`. A small PowerShell monitor watches the four application process identities and requests a stack shutdown if one exits unexpectedly. Startup validates process identity, detects early exit and API readiness/port failures, and tears down processes started by a failed boot. Shutdown uses a local request so Python processes can close HTTP/RabbitMQ connections and exit; it allows 15 seconds before force-stopping any process that does not respond. This is best-effort graceful shutdown on Windows, not a Windows Service wrapper.
+
+Stop the managed application processes:
 
 ```powershell
 .\scripts\stop-local.ps1
 ```
 
-The local boot command does not install/start third-party services. If either service is stopped, start it using Windows **Services**, then rerun the application command. OpenAPI documentation is at `http://127.0.0.1:8000/docs` with the default settings. The API process also runs by itself with:
+The application commands do not start or stop PostgreSQL/RabbitMQ Windows services. Use **Services** or the service's documented CLI commands to manage those prerequisites. API docs are at `http://127.0.0.1:8000/docs` with the default settings.
+
+### Individual processes for debugging
+
+After setup/configuration and (if needed) `.\.venv\Scripts\alembic.exe upgrade head`, each component can be run in a separate terminal from the project root:
 
 ```powershell
 .\.venv\Scripts\python.exe -m app.processes.api
-```
-
-The other independent processes can be run in separate PowerShell windows:
-
-```powershell
 .\.venv\Scripts\python.exe -m app.processes.outbox_publisher
 .\.venv\Scripts\python.exe -m app.processes.inbound_consumer
 .\.venv\Scripts\python.exe -m app.processes.worker_simulator --fail-rate 0 --min-delay-ms 250 --max-delay-ms 1000
 ```
 
-Worker options also have `.env` defaults (`WORKER_FAIL_RATE`, `WORKER_MIN_DELAY_MS`, `WORKER_MAX_DELAY_MS`). Restart the worker with `--fail-rate 1` to reproduce failed provisioning; `--fail-rate 0` returns success. Delay values are milliseconds. A task is acknowledged only after both status updates have broker confirms; if a progress publish fails, the task is requeued and may be processed again with the same stable update IDs. Malformed task messages are dead-lettered.
-
-Inbound database retry behavior is configurable with `INBOUND_RETRY_SECONDS`, `INBOUND_RETRY_MAX_SECONDS`, and `INBOUND_RETRY_MAX_ATTEMPTS` in `.env`. Retry queues are durable and TTL-based, so delayed updates survive consumer restarts. Terminal-before-progress messages are dead-lettered immediately rather than retried; stale progress after a terminal task is acknowledged as an idempotent no-op.
+The simulator accepts `--fail-rate` in `[0,1]`, non-negative `--min-delay-ms`, and `--max-delay-ms` greater than or equal to the minimum. These also default from `.env` as `WORKER_FAIL_RATE`, `WORKER_MIN_DELAY_MS`, and `WORKER_MAX_DELAY_MS`.
 
 ## HTTP API
 
-All timestamps are UTC ISO 8601 strings with exactly millisecond precision and a `Z` suffix. List endpoints return `{ "items": [...], "limit": n, "offset": n }`. `limit` defaults to 50 and is capped at 100.
+Timestamps are UTC ISO 8601 with millisecond precision and trailing `Z`. Lists return `{ "items": [...], "limit": n, "offset": n }`; limit defaults to 50 and is capped at 100.
 
 | Method | Path | Behavior |
 |---|---|---|
-| `POST` | `/tenants` | Create `provisioning` tenant and accepted `deploy` task; returns `202`. |
-| `GET` | `/tenants?limit=50&offset=0` | List tenants. |
-| `GET` | `/tenants/{tenant_id}` | Get a tenant. |
-| `PATCH` | `/tenants/{tenant_id}` | Require `version` and `name`; only an `active` tenant can be updated. Creates an `update` task and returns `202`. |
-| `DELETE` | `/tenants/{tenant_id}` | Only `active` or `failed` tenants can be deleted. Creates a `destroy` task and returns `202`. |
-| `GET` | `/tasks?limit=50&offset=0` | List tasks. |
-| `GET` | `/tasks/{task_id}` | Get a task. |
+| `POST` | `/tenants` | Create a provisioning tenant and accepted deploy task; `202`. |
+| `GET` | `/tenants?limit=50&offset=0` | List tenants; `200`. |
+| `GET` | `/tenants/{tenant_id}` | Get a tenant; `200` or structured `tenant_not_found`/`404`. |
+| `PATCH` | `/tenants/{tenant_id}` | Update an active tenant with optimistic version; `202`. |
+| `DELETE` | `/tenants/{tenant_id}` | Start destruction from active/failed; `202`. Tenant row is retained. |
+| `GET` | `/tasks?limit=50&offset=0` | List read-only tasks; `200`. |
+| `GET` | `/tasks/{task_id}` | Get a task; `200` or `task_not_found`/`404`. |
 
-Example create:
+Create:
 
 ```powershell
-Invoke-RestMethod -Method Post `
+$tenant = Invoke-RestMethod -Method Post `
   -Uri http://127.0.0.1:8000/tenants `
   -ContentType application/json `
   -Body '{"slug":"acme-prod","name":"Acme Production"}'
+$tenant
 ```
 
-Poll `GET /tenants/{id}` and `GET /tasks` to observe `provisioning` / `accepted`, then `active` / `done`. Once active, PATCH with the current version:
+Example immediate response:
+
+```json
+{
+  "id": "<tenant-uuid>",
+  "slug": "acme-prod",
+  "name": "Acme Production",
+  "status": "provisioning",
+  "version": 1,
+  "created_at": "2026-10-29T06:00:00.123Z",
+  "updated_at": "2026-10-29T06:00:00.123Z"
+}
+```
+
+PATCH requires the current integer `version` in the JSON body, for example `{"version":2,"name":"Acme Updated"}`. Missing/invalid versions return `validation_error`/`422`; a stale version returns `tenant_version_conflict`/`409`. Duplicate slugs return `tenant_already_exists`/`409`; invalid lifecycle operations return `tenant_update_not_allowed`/`409`. Errors are structured as `{"error":{"code":"...","message":"..."}}`.
+
+Read a task or list the most recent page:
 
 ```powershell
-Invoke-RestMethod -Method Patch `
-  -Uri http://127.0.0.1:8000/tenants/<tenant-id> `
-  -ContentType application/json `
-  -Body '{"version":2,"name":"Acme Updated"}'
+Invoke-RestMethod "http://127.0.0.1:8000/tasks/<task-uuid>"
+Invoke-RestMethod "http://127.0.0.1:8000/tasks?limit=50&offset=0"
 ```
 
-The deploy completion increments version from 1 to 2. PATCH requires that current version in its JSON body; accepting the update atomically changes the name, moves the tenant to `updating`, increments its version, and creates the update task and outbox row in the same PostgreSQL transaction. A later successful worker update moves the tenant back to `active`; failure moves it to `failed`.
+An accepted task detail has this shape:
 
-The expected version format is a required JSON integer field named `version` in the PATCH body (for example `{"version":2,"name":"Acme Updated"}`). Missing, null, non-integer, or less-than-one versions return the structured `validation_error` response with HTTP 422. Stale versions return `tenant_version_conflict` with HTTP 409. This choice keeps the optimistic-lock precondition explicit in the request body rather than introducing an ETag/`If-Match` header.
+```json
+{
+  "id": "<task-uuid>",
+  "type": "deploy",
+  "tenant_id": "<tenant-uuid>",
+  "status": "accepted",
+  "created_at": "2026-10-29T06:00:00.123Z",
+  "updated_at": "2026-10-29T06:00:00.123Z"
+}
+```
 
-The API persists the corresponding outbox record in the same database transaction; the tenant API handler does not publish to RabbitMQ. Errors use a stable structured response, for example:
+For example, a duplicate slug returns HTTP `409`:
 
 ```json
 {
   "error": {
-    "code": "tenant_version_conflict",
-    "message": "Expected version 2, current version is 3"
+    "code": "tenant_already_exists",
+    "message": "Tenant slug 'acme-prod' already exists"
   }
 }
 ```
 
-Contract codes: `tenant_not_found` (404), `task_not_found` (404), `tenant_already_exists` (409), `tenant_update_not_allowed` (409), and `tenant_version_conflict` (409). Request validation errors return `validation_error` with field details (422). A duplicate slug is enforced by PostgreSQL’s unique constraint, so simultaneous creates cannot both win.
+## Reproducible end-to-end scenarios
 
-## Reproducible messaging scenarios
+These are local PowerShell examples. Use fresh slugs for create scenarios. Poll tenant/task detail until the asynchronous status changes.
 
-**Worker failure:** stop only the managed worker (leave the API, publisher, and consumer running), then restart it separately:
+### Provision, update, and destroy successfully
+
+```powershell
+$base = "http://127.0.0.1:8000"
+function Wait-TenantStatus($tenantId, $expectedStatus) {
+  for ($i=0; $i -lt 60; $i++) {
+    $current = Invoke-RestMethod "$base/tenants/$tenantId"
+    if ($current.status -eq $expectedStatus) { return $current }
+    Start-Sleep -Milliseconds 250
+  }
+  throw "Tenant $tenantId did not reach $expectedStatus."
+}
+function Wait-TaskStatus($tenantId, $taskType, $expectedStatus) {
+  for ($i=0; $i -lt 60; $i++) {
+    $task = (Invoke-RestMethod "$base/tasks?limit=100").items |
+      Where-Object { $_.tenant_id -eq $tenantId -and $_.type -eq $taskType } |
+      Sort-Object created_at -Descending | Select-Object -First 1
+    if ($task -and $task.status -eq $expectedStatus) { return $task }
+    Start-Sleep -Milliseconds 250
+  }
+  throw "$taskType task for tenant $tenantId did not reach $expectedStatus."
+}
+$slug = "e2e-" + [guid]::NewGuid().ToString("N").Substring(0,10)
+$tenant = Invoke-RestMethod -Method Post -Uri "$base/tenants" `
+  -ContentType application/json -Body (@{slug=$slug;name="E2E Acme"} | ConvertTo-Json -Compress)
+$deploy = Wait-TaskStatus $tenant.id "deploy" "done"
+$active = Wait-TenantStatus $tenant.id "active"
+
+$updated = Invoke-RestMethod -Method Patch -Uri "$base/tenants/$($tenant.id)" `
+  -ContentType application/json `
+  -Body (@{version=$active.version; name="E2E Acme Updated"} | ConvertTo-Json -Compress)
+$updateTask = Wait-TaskStatus $tenant.id "update" "done"
+$active = Wait-TenantStatus $tenant.id "active"
+
+$destroying = Invoke-RestMethod -Method Delete -Uri "$base/tenants/$($tenant.id)"
+$destroyTask = Wait-TaskStatus $tenant.id "destroy" "done"
+$destroyed = Wait-TenantStatus $tenant.id "destroyed"
+[pscustomobject]@{
+  Deploy = $deploy.status
+  Update = $updateTask.status
+  Destroy = $destroyTask.status
+  FinalTenantStatus = $destroyed.status
+}
+```
+
+The API response to PATCH/DELETE is asynchronous; use tenant/task GET routes to verify final outcomes.
+
+### Reproduce a 100% worker failure
+
+The simplest managed-stack method is to set `WORKER_FAIL_RATE=1.0` in `.env` before startup. To restart only the managed worker with command-line options, stop its exact PID and start a replacement:
 
 ```powershell
 $workerPid = [int](Get-Content .run\worker.pid -Raw)
 Stop-Process -Id $workerPid
 Remove-Item .run\worker.pid
-.\.venv\Scripts\python.exe -m app.processes.worker_simulator --fail-rate 1
+$python = (Resolve-Path .\.venv\Scripts\python.exe).Path
+$worker = Start-Process -FilePath $python `
+  -ArgumentList @("-m","app.processes.worker_simulator","--fail-rate","1","--min-delay-ms","0","--max-delay-ms","0") `
+  -WorkingDirectory (Get-Location).Path `
+  -RedirectStandardOutput logs\worker.out.log -RedirectStandardError logs\worker.err.log -PassThru
+Set-Content .run\worker.pid $worker.Id
 ```
 
-Use the API to create a fresh tenant; its task should finish as failed and its tenant should become failed. Stop that worker and restart with `--fail-rate 0` for successful tasks. For the all-process script, set `WORKER_FAIL_RATE` in `.env` before running `start-local.ps1`.
+Create a fresh tenant; its task should reach `failed`, and the tenant should reach `failed`. Restore normal operation by stopping this worker and rerunning `.\scripts\start-local.ps1` after confirming the `.env` fail rate is `0`. The targeted command-line restart above is intentionally explicit; the normal stack startup reads the `.env` defaults.
 
-**Duplicate and out-of-order progress:** create a tenant and copy its task ID from `GET /tasks`. The helper sends a caller-specified stable update ID to the real RabbitMQ updates queue:
+### Duplicate, stale, and out-of-order worker updates
+
+To drive a task manually, first stop the worker so it does not race the test, create a tenant, and get its deploy task ID. Publish a valid progress update followed by a terminal update, repeat the terminal update with its **same** ID, then send a new stale progress ID:
 
 ```powershell
-.\.venv\Scripts\python.exe .\scripts\publish-update.py --task-id <task-id> --status in_progress --update-id manual-<task-id>-progress
-.\.venv\Scripts\python.exe .\scripts\publish-update.py --task-id <task-id> --status done --update-id manual-<task-id>-done
-.\.venv\Scripts\python.exe .\scripts\publish-update.py --task-id <task-id> --status in_progress --update-id manual-<task-id>-late-progress
+$taskId = "<deploy-task-uuid>"
+$progressId = "${taskId}:in_progress"
+$doneId = "${taskId}:done"
+.\.venv\Scripts\python.exe .\scripts\publish-update.py --task-id $taskId --status in_progress --update-id $progressId
+.\.venv\Scripts\python.exe .\scripts\publish-update.py --task-id $taskId --status done --update-id $doneId
+.\.venv\Scripts\python.exe .\scripts\publish-update.py --task-id $taskId --status done --update-id $doneId
+.\.venv\Scripts\python.exe .\scripts\publish-update.py --task-id $taskId --status in_progress --update-id "${taskId}:late-progress"
+Invoke-RestMethod "http://127.0.0.1:8000/tasks/$taskId"
+Invoke-RestMethod "http://127.0.0.1:8000/tenants/<tenant-uuid>"
 ```
 
-Repeat the second command with the same update ID to demonstrate deduplication. The terminal `done` result is applied, while the later `in_progress` is acknowledged but cannot regress the task or tenant. The helper publishes to RabbitMQ directly, so use a fresh tenant/task or stop the simulator when manually driving that task.
+The task remains `done`, the tenant remains `active`, and duplicate ID handling does not increment the tenant version twice. For an invalid early terminal, publish `done` before `in_progress`: the update is dead-lettered with no state change. Then publish `in_progress` and replay that same `done` update ID; it can now be applied. Inspect dead-letter queue depth with `rabbitmqctl.bat list_queues name messages` (run in the correct RabbitMQ node context).
 
-## Tests and quality command
+### Concurrent PATCH requests using one expected version
 
-Create the test database and RabbitMQ test virtual host as above, then set `TEST_DATABASE_URL` and `TEST_RABBITMQ_URL` in the current PowerShell session to their connection strings. The database name must end in `_test`. Run the full quality gate:
+First provision and activate a tenant, then run two requests with the same current version. This PowerShell example uses two background jobs:
+
+```powershell
+$url = "http://127.0.0.1:8000/tenants/<tenant-uuid>"
+$version = 2
+$jobs = @(
+  Start-Job -ArgumentList $url,$version,"Concurrent A" -ScriptBlock {
+    param($uri,$expectedVersion,$name)
+    try {
+      Invoke-RestMethod -Method Patch -Uri $uri -ContentType application/json `
+        -Body (@{version=[int]$expectedVersion;name=$name} | ConvertTo-Json -Compress) | Out-Null
+      "accepted"
+    } catch { [int]$_.Exception.Response.StatusCode }
+  }
+  Start-Job -ArgumentList $url,$version,"Concurrent B" -ScriptBlock {
+    param($uri,$expectedVersion,$name)
+    try {
+      Invoke-RestMethod -Method Patch -Uri $uri -ContentType application/json `
+        -Body (@{version=[int]$expectedVersion;name=$name} | ConvertTo-Json -Compress) | Out-Null
+      "accepted"
+    } catch { [int]$_.Exception.Response.StatusCode }
+  }
+)
+Receive-Job -Job $jobs -Wait -AutoRemoveJob
+```
+
+Expect one `accepted` and one `409`. PostgreSQL integration test `test_same_version_patch_has_only_one_winner` exercises the concurrent race directly.
+
+### RabbitMQ outage and recovery
+
+With appropriate Windows service permissions, stop RabbitMQ through **Services** or:
+
+```powershell
+Stop-Service -Name RabbitMQ
+```
+
+Create a tenant while RabbitMQ is unavailable. The API still commits its tenant/task/outbox transaction; no event is lost. The outbox publisher retains the unpublished row and backs off. Start the RabbitMQ service again:
+
+```powershell
+Start-Service -Name RabbitMQ
+```
+
+The publisher reconnects and retries the pending event, after which the worker and consumer process the lifecycle. Inspect `logs\outbox.err.log`, `logs\worker.err.log`, and `logs\consumer.err.log` if recovery does not proceed. Do not mark an event published manually.
+
+### Restart and persistence
+
+Save a tenant ID, then stop and restart the application:
+
+```powershell
+$tenantId = "<tenant-uuid>"
+.\scripts\stop-local.ps1
+.\scripts\start-local.ps1
+Invoke-RestMethod "http://127.0.0.1:8000/tenants/$tenantId"
+```
+
+Tenant/task state remains in PostgreSQL across application restarts. Pending outbox records and inbound retry messages are also durable.
+
+## Tests and quality/security checks
+
+Full automated tests require Python dependencies, a disposable PostgreSQL database whose name ends `_test`, and a dedicated RabbitMQ virtual host whose name ends `_test`. Configure `TEST_DATABASE_URL` and `TEST_RABBITMQ_URL` in `.env` or the current PowerShell environment. The test command never starts the API or worker; HTTP tests use FastAPI's in-process test client, worker/consumer tests call message handlers directly, and integration tests use the real local PostgreSQL/RabbitMQ services. Integration fixtures run Alembic migrations. Tests create unique tenant slugs and clean up database records; RabbitMQ probe queues are exclusive, while declared durable retry/topology queues remain empty in the test vhost.
+
+Run the one-command full quality gate:
 
 ```powershell
 .\scripts\quality.ps1
 ```
 
-It verifies real PostgreSQL and RabbitMQ connectivity, applies migrations to the designated test database, checks formatting and lint with Ruff, scans the application with Bandit, and runs pytest. Unit tests cover schema, structured API errors, and state transitions. PostgreSQL integration tests exercise concurrent duplicate-slug creation, competing PATCH requests with one version, worker success/failure for deploy/update/destroy, duplicate and out-of-order updates, consumer recovery, bounded database retry, broker failure handling, and outbox publication/retry/restart behavior; they use unique slugs and clean up their created rows. RabbitMQ integration tests confirm persistent message round-trips and durable retry-queue declarations. Without the matching test URL, an integration test is explicitly reported as skipped by pytest. The quality script requires both test services rather than silently skipping service checks.
+It loads `.env` values only when the corresponding PowerShell environment variable is unset, requires distinct test resources, verifies service connectivity, migrates the test database, verifies Ruff formatting and lint, runs Bandit static security checks, audits installed dependency versions against the Python advisory database with `pip-audit`, and runs pytest.
 
-## Scope note
+Useful focused commands after `.\scripts\setup-local.ps1` and configuration:
 
-The assignment’s cold-start example expects all dependencies to start with one command, originally in containers. During local Phases 1–5, this project’s one-command boot starts all **application** processes but requires preinstalled, configured PostgreSQL and RabbitMQ Windows services. Fully automating their installation, Windows service setup, users, permissions, and firewall configuration is not reliable or appropriate without administrator-specific decisions. No Dockerfile, Compose file, Docker dependency, or container startup command is included in this local implementation.
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\ruff.exe format --check app tests alembic scripts
+.\.venv\Scripts\ruff.exe check app tests alembic scripts
+.\.venv\Scripts\bandit.exe -q -r app scripts
+.\.venv\Scripts\pip-audit.exe --skip-editable
+```
+
+`pip-audit` uses the network advisory service; a network outage can block that check even when application tests work. For PostgreSQL/RabbitMQ failures, the scripts report which test URL or service check failed. Startup diagnostics are in the per-process logs under `logs\`. For migration failures, inspect the Alembic output and verify `DATABASE_URL`/`TEST_DATABASE_URL` point to the intended databases. If port 8000 is occupied, set an unused `API_PORT` in `.env`; startup checks the configured API endpoint and cleans up its own partially started processes.
+
+### Troubleshooting
+
+| Symptom | Checks and recovery |
+|---|---|
+| PostgreSQL connection refused | Confirm the `postgresql-x64-*` Windows service is running; verify `DATABASE_URL` host/port, then run `pg_isready -h localhost -p 5432`. |
+| PostgreSQL authentication/database error | Verify the application role, password, database, and grants using `psql`; URL-encode special password characters in `.env`. |
+| RabbitMQ connection refused | Confirm the RabbitMQ Windows service is running and listening on AMQP port 5672; run `rabbitmq-diagnostics.bat -q ping`. |
+| RabbitMQ access refused or vhost missing | Verify the exact virtual host, user, permissions, and CLI/service Erlang cookie; use `rabbitmqctl.bat list_permissions -p <vhost>`. |
+| Alembic migration fails | Read the migration error printed by startup. Confirm the URL points to the intended PostgreSQL database and the configured role can create/alter schema objects. Do not repair by using `create_all`; migrations are authoritative. |
+| API port already occupied | Change `API_PORT` to a free port, then rerun startup. Logs under `logs\api.err.log` show API boot errors. |
+| A process exits during startup | Startup checks each process and API readiness, then stops the processes it launched. Inspect the matching `logs\<api|outbox|consumer|worker>.err.log` and verify dependency configuration. An unexpected exit after startup is recorded in `logs\monitor.events.log`, and the monitor requests a clean stack shutdown. |
+| `.env` has placeholders after first boot | Edit `.env` with the one-time local database and broker credentials. Startup never overwrites it; rerun `.\scripts\start-local.ps1`. |
+| `pip-audit` cannot reach advisory data | Restore HTTPS/network access to PyPI/advisory endpoints and rerun `.\scripts\quality.ps1`; do not interpret an unavailable scan as a pass. |
+
+## Scope and known limitations
+
+The assignment's earlier setup description assumes dependencies can be started by one boot command. This Windows/local phase assumes PostgreSQL, RabbitMQ, and Erlang are already installed, configured, and running; those machine-level operations require administrator and credential choices. The application boot command initializes the Python environment and all application processes but deliberately does not install/start system services. No Dockerfile, Compose file, container setup, or Docker dependency is present.

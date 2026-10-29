@@ -5,7 +5,7 @@ from uuid import UUID, uuid4
 
 import pika
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, event, select
 from sqlalchemy.exc import OperationalError
 
 from app.core.time import utc_now
@@ -272,6 +272,30 @@ def test_duplicate_updates_and_restart_do_not_change_state_twice(monkeypatch, te
     assert restarted_consumer_channel.acks == [2]
     assert restarted_consumer_channel.nacks == []
     assert _saved_state(UUID(task_event["id"]), tenant_id) == before
+
+
+def test_task_tenant_and_processed_record_roll_back_together_on_commit_failure(tenant_ids):
+    tenant_id, task_id = _create_tenant(tenant_ids)
+    update = WorkerUpdate(
+        update_id=f"{task_id}:in_progress",
+        task_id=task_id,
+        status="in_progress",
+        occurred_at=utc_now(),
+    )
+
+    def fail_commit(_session) -> None:
+        raise RuntimeError("simulated commit failure")
+
+    event.listen(SessionLocal, "before_commit", fail_commit)
+    try:
+        with SessionLocal() as session, pytest.raises(RuntimeError, match="simulated commit"):
+            apply_worker_update(session, update)
+    finally:
+        event.remove(SessionLocal, "before_commit", fail_commit)
+
+    assert _saved_state(task_id, tenant_id) == ("accepted", "provisioning", 1)
+    with SessionLocal() as session:
+        assert session.get(ProcessedUpdate, update.update_id) is None
 
 
 def test_out_of_order_stale_progress_is_ignored_and_early_terminal_is_dead_lettered(

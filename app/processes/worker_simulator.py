@@ -1,6 +1,7 @@
 import argparse
 import logging
 import secrets
+import threading
 import time
 
 import pika
@@ -16,6 +17,7 @@ from app.messaging.rabbit import (
     publish_json,
     retry_connection,
 )
+from app.processes.shutdown import shutdown_event, watch_shutdown
 from app.schemas import TaskEvent, WorkerUpdate
 
 logger = logging.getLogger(__name__)
@@ -90,13 +92,22 @@ def handle_delivery(channel, method, properties, body: bytes, args: argparse.Nam
     logger.info("Completed task id=%s outcome=%s", task.id, outcome)
 
 
-def run(args: argparse.Namespace) -> None:
+def run(args: argparse.Namespace, stop_event: threading.Event | None = None) -> None:
+    if stop_event is None:
+        stop_event = shutdown_event()
     connection = connect()
     try:
         channel = connection.channel()
         declare_topology(channel)
         channel.confirm_delivery()
         channel.basic_qos(prefetch_count=1)
+
+        def stop_consuming() -> None:
+            stop_event.set()
+            if connection.is_open and channel.is_open:
+                connection.add_callback_threadsafe(channel.stop_consuming)
+
+        watch_shutdown(stop_consuming)
         channel.basic_consume(
             queue=TASK_QUEUE,
             on_message_callback=lambda callback_channel, method, properties, body: handle_delivery(
@@ -119,7 +130,8 @@ def run(args: argparse.Namespace) -> None:
 def main() -> None:
     logging.basicConfig(level=get_settings().log_level.upper())
     args = parse_args()
-    retry_connection(lambda: run(args), "worker simulator")
+    stop_event = shutdown_event()
+    retry_connection(lambda: run(args, stop_event), "worker simulator", stop_event)
 
 
 if __name__ == "__main__":

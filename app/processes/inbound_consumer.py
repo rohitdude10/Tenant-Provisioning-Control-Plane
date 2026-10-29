@@ -1,4 +1,5 @@
 import logging
+import threading
 
 import pika
 from sqlalchemy.exc import DataError, IntegrityError, SQLAlchemyError
@@ -16,6 +17,7 @@ from app.messaging.rabbit import (
     publish_json,
     retry_connection,
 )
+from app.processes.shutdown import shutdown_event, watch_shutdown
 from app.schemas import WorkerUpdate
 from app.services import InvalidWorkerUpdate, apply_worker_update
 
@@ -114,7 +116,9 @@ def handle_delivery(channel, method, properties, body: bytes) -> None:
     )
 
 
-def run() -> None:
+def run(stop_event: threading.Event | None = None) -> None:
+    if stop_event is None:
+        stop_event = shutdown_event()
     check_database()
     connection = connect()
     try:
@@ -122,6 +126,13 @@ def run() -> None:
         declare_topology(channel)
         channel.confirm_delivery()
         channel.basic_qos(prefetch_count=1)
+
+        def stop_consuming() -> None:
+            stop_event.set()
+            if connection.is_open and channel.is_open:
+                connection.add_callback_threadsafe(channel.stop_consuming)
+
+        watch_shutdown(stop_consuming)
         channel.basic_consume(queue=UPDATE_QUEUE, on_message_callback=handle_delivery)
         logger.info("Inbound consumer listening on %s", UPDATE_QUEUE)
         channel.start_consuming()
@@ -132,7 +143,8 @@ def run() -> None:
 
 def main() -> None:
     logging.basicConfig(level=get_settings().log_level.upper())
-    retry_connection(run, "inbound consumer")
+    stop_event = shutdown_event()
+    retry_connection(lambda: run(stop_event), "inbound consumer", stop_event)
 
 
 if __name__ == "__main__":

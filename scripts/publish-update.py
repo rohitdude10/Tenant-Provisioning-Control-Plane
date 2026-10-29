@@ -24,7 +24,12 @@ def main() -> None:
         channel = connection.channel()
         declare_topology(channel)
         channel.confirm_delivery()
-        publish_json(channel, UPDATE_QUEUE, message.model_dump(mode="json"))
+        publish_json(
+            channel,
+            UPDATE_QUEUE,
+            message.model_dump(mode="json"),
+            message_id=message.update_id,
+        )
     finally:
         connection.close()
     logging.info("Published update %s for task %s", args.update_id, args.task_id)
