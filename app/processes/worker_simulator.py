@@ -3,7 +3,7 @@ import logging
 import secrets
 import time
 
-from pydantic import ValidationError
+import pika
 
 from app.core.config import get_settings
 from app.core.time import utc_now
@@ -42,7 +42,52 @@ def _publish_update(channel, task: TaskEvent, status: str) -> None:
         status=status,
         occurred_at=utc_now(),
     )
-    publish_json(channel, UPDATE_QUEUE, update.model_dump(mode="json"))
+    publish_json(
+        channel,
+        UPDATE_QUEUE,
+        update.model_dump(mode="json"),
+        message_id=update.update_id,
+    )
+
+
+def _process_task(channel, task: TaskEvent, args: argparse.Namespace) -> str:
+    _publish_update(channel, task, "in_progress")
+    delay_ms = args.min_delay_ms + secrets.randbelow(args.max_delay_ms - args.min_delay_ms + 1)
+    time.sleep(delay_ms / 1000)
+    failure_threshold = int(args.fail_rate * 1_000_000)
+    outcome = "failed" if secrets.randbelow(1_000_000) < failure_threshold else "done"
+    _publish_update(channel, task, outcome)
+    return outcome
+
+
+def handle_delivery(channel, method, properties, body: bytes, args: argparse.Namespace) -> None:
+    try:
+        task = decode_message(body, TaskEvent.model_validate)
+    except ValueError as exc:
+        logger.error("Rejecting malformed task message: %s", exc)
+        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+        return
+    message_id = getattr(properties, "message_id", None)
+    if message_id is not None and message_id != str(task.id):
+        logger.error(
+            "Rejecting task message with mismatched broker message ID task_id=%s message_id=%s",
+            task.id,
+            message_id,
+        )
+        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+        return
+    if task.status != "accepted":
+        logger.warning("Ignoring non-accepted task event id=%s status=%s", task.id, task.status)
+        channel.basic_ack(delivery_tag=method.delivery_tag)
+        return
+    try:
+        outcome = _process_task(channel, task, args)
+    except (pika.exceptions.AMQPError, OSError, TimeoutError):
+        logger.exception("Worker could not publish task progress; task will be retried")
+        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+        return
+    channel.basic_ack(delivery_tag=method.delivery_tag)
+    logger.info("Completed task id=%s outcome=%s", task.id, outcome)
 
 
 def run(args: argparse.Namespace) -> None:
@@ -52,36 +97,12 @@ def run(args: argparse.Namespace) -> None:
         declare_topology(channel)
         channel.confirm_delivery()
         channel.basic_qos(prefetch_count=1)
-
-        def handle_delivery(channel, method, properties, body: bytes) -> None:
-            try:
-                task = decode_message(body, TaskEvent.model_validate)
-            except (ValueError, ValidationError) as exc:
-                logger.error("Rejecting malformed task message: %s", exc)
-                channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-                return
-            if task.status != "accepted":
-                logger.warning(
-                    "Ignoring non-accepted task event id=%s status=%s", task.id, task.status
-                )
-                channel.basic_ack(delivery_tag=method.delivery_tag)
-                return
-            try:
-                _publish_update(channel, task, "in_progress")
-                delay_ms = args.min_delay_ms + secrets.randbelow(
-                    args.max_delay_ms - args.min_delay_ms + 1
-                )
-                time.sleep(delay_ms / 1000)
-                failure_threshold = int(args.fail_rate * 1_000_000)
-                outcome = "failed" if secrets.randbelow(1_000_000) < failure_threshold else "done"
-                _publish_update(channel, task, outcome)
-                channel.basic_ack(delivery_tag=method.delivery_tag)
-                logger.info("Completed task id=%s outcome=%s", task.id, outcome)
-            except Exception:
-                logger.exception("Worker failed to publish task progress; task will be retried")
-                channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-
-        channel.basic_consume(queue=TASK_QUEUE, on_message_callback=handle_delivery)
+        channel.basic_consume(
+            queue=TASK_QUEUE,
+            on_message_callback=lambda callback_channel, method, properties, body: handle_delivery(
+                callback_channel, method, properties, body, args
+            ),
+        )
         logger.info(
             "Worker listening on %s (fail_rate=%.3f delay_ms=%d..%d)",
             TASK_QUEUE,

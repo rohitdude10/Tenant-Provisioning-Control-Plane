@@ -23,13 +23,17 @@ A Python/FastAPI control plane that persists tenant and task state in PostgreSQL
 
 The API, outbox publisher, inbound consumer, and worker simulator are separate Python processes. PostgreSQL is the source of truth. API mutations update the tenant and create its task and outbox row within one transaction. The publisher claims pending rows with PostgreSQL `FOR UPDATE SKIP LOCKED`, keeps the claim locked through RabbitMQ publisher confirmation, and marks a row published only after confirmation. Transient broker failures persist an exponentially increasing retry time in PostgreSQL, capped by `OUTBOX_RETRY_MAX_SECONDS`; a publisher restart therefore preserves pending work and its retry schedule. If it crashes after broker confirmation but before the published marker commits, the event can be delivered again; the task UUID is used as both the event ID and RabbitMQ message ID, and consumers must be idempotent. This is at-least-once delivery, not exactly-once delivery.
 
-The RabbitMQ queues are durable quorum queues:
+The RabbitMQ work and update queues are durable quorum queues:
 
 - `tenant.provisioning.tasks` — accepted task events sent to the worker.
 - `tenant.provisioning.updates` — worker progress updates sent to the control plane.
 - `tenant.provisioning.tasks.dead` and `tenant.provisioning.updates.dead` — rejected poison messages.
 
-The inbound consumer records stable update IDs in PostgreSQL and locks the affected task while applying an update. Duplicate IDs do nothing. Updates that would regress a terminal task are recorded and ignored. Database errors are retried with a delay; malformed and otherwise unprocessable messages are dead-lettered rather than stopping the consumer.
+The worker validates each task event, publishes `in_progress` followed by `done` or `failed`, and waits for RabbitMQ publisher confirms for both updates before acknowledging the task. If publishing fails, it requeues the task; its deterministic `task-id:status` update IDs make republished progress idempotent. Malformed task events are rejected to the task dead-letter queue, and already-progressed task events are acknowledged without repeating work.
+
+The inbound consumer commits the task mutation, tenant mutation, and unique `processed_updates` record in one PostgreSQL transaction, then acknowledges the RabbitMQ update. Duplicate update IDs are acknowledged without changing state. Stale updates after a terminal task are recorded and ignored. A terminal result received while its task is still `accepted` is invalid: it is not recorded or applied and is dead-lettered immediately; it must not skip the required `accepted -> in_progress -> terminal` progression. Operators can correct the ordering and replay that update, retaining its original update ID. This is a permanent rejection rather than an automatic requeue, so it cannot loop forever.
+
+Transient database errors are republished with publisher confirms to durable TTL retry queues, then acknowledged from the original queue. Backoff doubles from `INBOUND_RETRY_SECONDS` up to `INBOUND_RETRY_MAX_SECONDS`; after `INBOUND_RETRY_MAX_ATTEMPTS` scheduled retries, a further database failure is dead-lettered. Malformed updates, unknown task IDs, invalid retry headers, and database constraint violations go directly to the dead-letter queue. If RabbitMQ is unavailable while a retry is being scheduled, the original message remains unacknowledged/requeued; the process-level broker reconnect loop backs off while preserving delivery.
 
 ## Phase 2 data model and transaction boundaries
 
@@ -126,7 +130,9 @@ The other independent processes can be run in separate PowerShell windows:
 .\.venv\Scripts\python.exe -m app.processes.worker_simulator --fail-rate 0 --min-delay-ms 250 --max-delay-ms 1000
 ```
 
-Worker options also have `.env` defaults (`WORKER_FAIL_RATE`, `WORKER_MIN_DELAY_MS`, `WORKER_MAX_DELAY_MS`). Restart the worker with `--fail-rate 1` to reproduce failed provisioning; `--fail-rate 0` returns success. Delay values are milliseconds.
+Worker options also have `.env` defaults (`WORKER_FAIL_RATE`, `WORKER_MIN_DELAY_MS`, `WORKER_MAX_DELAY_MS`). Restart the worker with `--fail-rate 1` to reproduce failed provisioning; `--fail-rate 0` returns success. Delay values are milliseconds. A task is acknowledged only after both status updates have broker confirms; if a progress publish fails, the task is requeued and may be processed again with the same stable update IDs. Malformed task messages are dead-lettered.
+
+Inbound database retry behavior is configurable with `INBOUND_RETRY_SECONDS`, `INBOUND_RETRY_MAX_SECONDS`, and `INBOUND_RETRY_MAX_ATTEMPTS` in `.env`. Retry queues are durable and TTL-based, so delayed updates survive consumer restarts. Terminal-before-progress messages are dead-lettered immediately rather than retried; stale progress after a terminal task is acknowledged as an idempotent no-op.
 
 ## HTTP API
 
@@ -208,7 +214,7 @@ Create the test database and RabbitMQ test virtual host as above, then set `TEST
 .\scripts\quality.ps1
 ```
 
-It verifies real PostgreSQL and RabbitMQ connectivity, applies migrations to the designated test database, checks formatting and lint with Ruff, scans the application with Bandit, and runs pytest. Unit tests cover schema, structured API errors, and state transitions. PostgreSQL integration tests exercise concurrent duplicate-slug creation, competing PATCH requests with one version, duplicate/stale worker updates, and outbox publication, retry persistence, restart recovery, duplicate delivery after the confirm/commit crash window, and concurrent publisher claims; they use unique slugs and clean up their created rows. The RabbitMQ integration test confirms a persistent message round-trip. Without the matching test URL, an integration test is explicitly reported as skipped by pytest. The quality script requires both test services rather than silently skipping service checks.
+It verifies real PostgreSQL and RabbitMQ connectivity, applies migrations to the designated test database, checks formatting and lint with Ruff, scans the application with Bandit, and runs pytest. Unit tests cover schema, structured API errors, and state transitions. PostgreSQL integration tests exercise concurrent duplicate-slug creation, competing PATCH requests with one version, worker success/failure for deploy/update/destroy, duplicate and out-of-order updates, consumer recovery, bounded database retry, broker failure handling, and outbox publication/retry/restart behavior; they use unique slugs and clean up their created rows. RabbitMQ integration tests confirm persistent message round-trips and durable retry-queue declarations. Without the matching test URL, an integration test is explicitly reported as skipped by pytest. The quality script requires both test services rather than silently skipping service checks.
 
 ## Scope note
 

@@ -232,7 +232,7 @@ def test_transaction_scope_commits_on_success_and_rolls_back_on_error():
 )
 def test_postgres_applies_only_permitted_task_transitions(current_status, incoming_status, allowed):
     from app.schemas import WorkerUpdate
-    from app.services import apply_worker_update
+    from app.services import InvalidWorkerUpdate, apply_worker_update
 
     tenant_status = {
         "accepted": "provisioning",
@@ -261,8 +261,13 @@ def test_postgres_applies_only_permitted_task_transitions(current_status, incomi
             status=incoming_status,
             occurred_at=now,
         )
-        with SessionLocal() as session:
-            applied = apply_worker_update(session, update)
+        if current_status == "accepted" and incoming_status in {"done", "failed"}:
+            with SessionLocal() as session, pytest.raises(InvalidWorkerUpdate):
+                apply_worker_update(session, update)
+            applied = False
+        else:
+            with SessionLocal() as session:
+                applied = apply_worker_update(session, update)
         with SessionLocal() as session:
             saved_task = session.get(Task, task.id)
             saved_tenant = session.get(Tenant, tenant.id)

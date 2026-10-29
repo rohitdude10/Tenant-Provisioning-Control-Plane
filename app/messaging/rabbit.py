@@ -16,7 +16,26 @@ TASK_DEAD_LETTER_EXCHANGE = "tenant.provisioning.tasks.dlx"
 TASK_DEAD_LETTER_QUEUE = "tenant.provisioning.tasks.dead"
 UPDATE_DEAD_LETTER_EXCHANGE = "tenant.provisioning.updates.dlx"
 UPDATE_DEAD_LETTER_QUEUE = "tenant.provisioning.updates.dead"
+UPDATE_RETRY_QUEUE_PREFIX = f"{UPDATE_QUEUE}.retry"
+UPDATE_RETRY_ATTEMPT_HEADER = "x-control-plane-retry-attempt"
 logger = logging.getLogger(__name__)
+
+
+def inbound_retry_delays() -> list[float]:
+    settings = get_settings()
+    delays = []
+    for attempt in range(1, settings.inbound_retry_max_attempts + 1):
+        delay = min(
+            settings.inbound_retry_seconds * (2 ** (attempt - 1)),
+            settings.inbound_retry_max_seconds,
+        )
+        delays.append(delay)
+    return delays
+
+
+def inbound_retry_queue_name(delay_seconds: float) -> str:
+    delay_ms = max(1, round(delay_seconds * 1000))
+    return f"{UPDATE_RETRY_QUEUE_PREFIX}.{delay_ms}ms"
 
 
 def connect() -> pika.BlockingConnection:
@@ -64,6 +83,16 @@ def declare_topology(channel: BlockingChannel) -> None:
             "x-dead-letter-routing-key": UPDATE_QUEUE,
         },
     )
+    for delay in inbound_retry_delays():
+        channel.queue_declare(
+            queue=inbound_retry_queue_name(delay),
+            durable=True,
+            arguments={
+                "x-message-ttl": max(1, round(delay * 1000)),
+                "x-dead-letter-exchange": "",
+                "x-dead-letter-routing-key": UPDATE_QUEUE,
+            },
+        )
 
 
 def publish_json(
@@ -72,6 +101,7 @@ def publish_json(
     body: dict[str, Any],
     *,
     message_id: str | None = None,
+    headers: dict[str, Any] | None = None,
 ) -> None:
     channel.basic_publish(
         exchange="",
@@ -81,6 +111,7 @@ def publish_json(
             content_type="application/json",
             delivery_mode=pika.DeliveryMode.Persistent,
             message_id=message_id,
+            headers=headers,
         ),
         mandatory=True,
     )

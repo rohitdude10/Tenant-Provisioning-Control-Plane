@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     outbox_retry_base_seconds: float = Field(default=1.0, gt=0)
     outbox_retry_max_seconds: float = Field(default=30.0, gt=0)
     inbound_retry_seconds: float = Field(default=2.0, gt=0)
+    inbound_retry_max_seconds: float = Field(default=30.0, gt=0)
+    inbound_retry_max_attempts: int = Field(default=5, ge=1, le=10)
     worker_fail_rate: float = Field(default=0.0, ge=0, le=1)
     worker_min_delay_ms: int = Field(default=250, ge=0)
     worker_max_delay_ms: int = Field(default=1000, ge=0)
@@ -54,6 +56,16 @@ class Settings(BaseSettings):
             raise ValueError(
                 "OUTBOX_RETRY_MAX_SECONDS must be greater than or equal to "
                 "OUTBOX_RETRY_BASE_SECONDS"
+            )
+        return value
+
+    @field_validator("inbound_retry_max_seconds")
+    @classmethod
+    def validate_inbound_retry_range(cls, value: float, info) -> float:
+        base = info.data.get("inbound_retry_seconds", 2.0)
+        if value < base:
+            raise ValueError(
+                "INBOUND_RETRY_MAX_SECONDS must be greater than or equal to INBOUND_RETRY_SECONDS"
             )
         return value
 

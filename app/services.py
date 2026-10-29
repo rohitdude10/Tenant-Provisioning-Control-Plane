@@ -3,6 +3,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -13,6 +14,10 @@ from app.models import OutboxEvent, ProcessedUpdate, Task, Tenant
 from app.schemas import TaskEvent, TenantCreate, TenantPatch, WorkerUpdate
 
 logger = logging.getLogger(__name__)
+
+
+class InvalidWorkerUpdate(ValueError):
+    """A permanent worker update error that must not be retried."""
 
 
 def _task_event(task: Task) -> dict[str, Any]:
@@ -177,20 +182,45 @@ def get_task(session: Session, task_id: UUID) -> Task:
     return task
 
 
+def _record_processed_update(session: Session, task: Task, update_message: WorkerUpdate) -> bool:
+    inserted_id = session.scalar(
+        postgresql_insert(ProcessedUpdate)
+        .values(
+            update_id=update_message.update_id,
+            task_id=task.id,
+            processed_at=utc_now(),
+        )
+        .on_conflict_do_nothing(index_elements=[ProcessedUpdate.update_id])
+        .returning(ProcessedUpdate.update_id)
+    )
+    if inserted_id is not None:
+        return True
+
+    existing = session.get(ProcessedUpdate, update_message.update_id)
+    if existing is not None and existing.task_id != task.id:
+        raise InvalidWorkerUpdate(
+            f"Worker update ID {update_message.update_id!r} is already assigned "
+            f"to task {existing.task_id}"
+        )
+    return False
+
+
 def apply_worker_update(session: Session, update_message: WorkerUpdate) -> bool:
     with session.begin():
         task = session.scalar(
             select(Task).where(Task.id == update_message.task_id).with_for_update()
         )
         if task is None:
-            raise ValueError(f"Worker update refers to unknown task {update_message.task_id}")
-        if session.get(ProcessedUpdate, update_message.update_id) is not None:
-            return False
-        session.add(
-            ProcessedUpdate(
-                update_id=update_message.update_id, task_id=task.id, processed_at=utc_now()
+            raise InvalidWorkerUpdate(
+                f"Worker update refers to unknown task {update_message.task_id}"
             )
-        )
+        if task.status == "accepted" and update_message.status in {"done", "failed"}:
+            raise InvalidWorkerUpdate(
+                f"Terminal update {update_message.update_id!r} arrived before "
+                f"task {task.id} entered in_progress"
+            )
+        if not _record_processed_update(session, task, update_message):
+            return False
         if not can_transition_task(task.status, update_message.status):
             logger.info(
                 "Ignoring stale task update id=%s task_id=%s current=%s incoming=%s",
