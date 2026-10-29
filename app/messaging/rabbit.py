@@ -66,7 +66,13 @@ def declare_topology(channel: BlockingChannel) -> None:
     )
 
 
-def publish_json(channel: BlockingChannel, routing_key: str, body: dict[str, Any]) -> None:
+def publish_json(
+    channel: BlockingChannel,
+    routing_key: str,
+    body: dict[str, Any],
+    *,
+    message_id: str | None = None,
+) -> None:
     channel.basic_publish(
         exchange="",
         routing_key=routing_key,
@@ -74,6 +80,7 @@ def publish_json(channel: BlockingChannel, routing_key: str, body: dict[str, Any
         properties=pika.BasicProperties(
             content_type="application/json",
             delivery_mode=pika.DeliveryMode.Persistent,
+            message_id=message_id,
         ),
         mandatory=True,
     )

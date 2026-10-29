@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     api_port: int = Field(default=8000, ge=1, le=65535)
     log_level: str = "INFO"
     outbox_poll_seconds: float = Field(default=1.0, gt=0)
+    outbox_retry_base_seconds: float = Field(default=1.0, gt=0)
+    outbox_retry_max_seconds: float = Field(default=30.0, gt=0)
     inbound_retry_seconds: float = Field(default=2.0, gt=0)
     worker_fail_rate: float = Field(default=0.0, ge=0, le=1)
     worker_min_delay_ms: int = Field(default=250, ge=0)
@@ -41,6 +43,17 @@ class Settings(BaseSettings):
         if value < minimum:
             raise ValueError(
                 "WORKER_MAX_DELAY_MS must be greater than or equal to WORKER_MIN_DELAY_MS"
+            )
+        return value
+
+    @field_validator("outbox_retry_max_seconds")
+    @classmethod
+    def validate_outbox_retry_range(cls, value: float, info) -> float:
+        base = info.data.get("outbox_retry_base_seconds", 1.0)
+        if value < base:
+            raise ValueError(
+                "OUTBOX_RETRY_MAX_SECONDS must be greater than or equal to "
+                "OUTBOX_RETRY_BASE_SECONDS"
             )
         return value
 

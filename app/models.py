@@ -86,7 +86,7 @@ class Task(Base):
 
 class OutboxEvent(Base):
     __tablename__ = "outbox_events"
-    __table_args__ = (Index("ix_outbox_pending", "published_at", "created_at"),)
+    __table_args__ = (Index("ix_outbox_pending", "published_at", "next_attempt_at", "created_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     task_id: Mapped[UUID] = mapped_column(
@@ -96,6 +96,7 @@ class OutboxEvent(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now
     )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error: Mapped[str | None] = mapped_column(String(1000))
